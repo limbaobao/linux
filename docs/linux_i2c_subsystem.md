@@ -13,6 +13,9 @@
 7. [I2C Slave模式](#7-i2c-slave模式)
 8. [SMBus支持](#8-smbus支持)
 9. [代码示例](#9-代码示例)
+10. [I2C算法详解 - Bit-Banging](#10-i2c算法详解---bit-banging)
+11. [I2C Adapter驱动详解 - 树莓派BCM2835](#11-i2c-adapter驱动详解---树莓派bcm2835)
+12. [算法与适配器对比总结](#12-算法与适配器对比总结)
 
 ---
 
@@ -1209,6 +1212,930 @@ MODULE_DESCRIPTION("I2C Slave Backend Driver Example");
 2. I2C Specification: [NXP I2C-bus specification](https://www.nxp.com/docs/en/user-guide/UM10204.pdf)
 3. SMBus Specification: [System Management Bus Specification](http://smbus.org/specs/)
 4. Linux Device Drivers, 3rd Edition - Chapter 14: The Linux Device Model
+
+---
+
+## 10. I2C算法详解 - Bit-Banging
+
+Bit-banging是一种通过软件直接控制GPIO引脚来模拟I2C时序的技术。这种方法不需要专用的I2C硬件控制器，但会占用更多的CPU时间。
+
+### 10.1 Bit-Bang算法架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      Bit-Banging I2C Algorithm                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                    ┌─────────────────────────────────┐
+                    │     I2C Core Layer              │
+                    │     i2c_transfer()              │
+                    └───────────────┬─────────────────┘
+                                    │
+                                    │ algo->master_xfer()
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     i2c-algo-bit.c                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    bit_xfer()                                        │   │
+│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐        │   │
+│  │  │ i2c_start │  │bit_doAddr │  │ sendbytes │  │ readbytes │        │   │
+│  │  │   ()      │  │   ()      │  │   ()      │  │   ()      │        │   │
+│  │  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘        │   │
+│  │        │              │              │              │               │   │
+│  │        ▼              ▼              ▼              ▼               │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│  │  │              Low-level Bit Operations                       │   │   │
+│  │  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐           │   │   │
+│  │  │  │ sdalo() │ │ sdahi() │ │ scllo() │ │ sclhi() │           │   │   │
+│  │  │  └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘           │   │   │
+│  │  └───────┼───────────┼───────────┼───────────┼─────────────────┘   │   │
+│  └──────────┼───────────┼───────────┼───────────┼─────────────────────┘   │
+└─────────────┼───────────┼───────────┼───────────┼─────────────────────────┘
+              │           │           │           │
+              ▼           ▼           ▼           ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                   struct i2c_algo_bit_data Callbacks                        │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐        │
+│  │  setsda()   │  │  getsda()   │  │  setscl()   │  │  getscl()   │        │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘        │
+└─────────┼────────────────┼────────────────┼────────────────┼────────────────┘
+          │                │                │                │
+          ▼                ▼                ▼                ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         GPIO Hardware                                       │
+│  ┌─────────────────────────────┐  ┌─────────────────────────────┐          │
+│  │           SDA Pin           │  │           SCL Pin           │          │
+│  │   (Open-Drain Output)       │  │   (Open-Drain Output)       │          │
+│  └─────────────────────────────┘  └─────────────────────────────┘          │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 10.2 核心数据结构 - i2c_algo_bit_data
+
+```c
+// include/linux/i2c-algo-bit.h
+struct i2c_algo_bit_data {
+    void *data;                     /* private data for lowlevel routines */
+    
+    /* GPIO control callbacks */
+    void (*setsda)(void *data, int state);  /* Set SDA line state */
+    void (*setscl)(void *data, int state);  /* Set SCL line state */
+    int  (*getsda)(void *data);             /* Get SDA line state */
+    int  (*getscl)(void *data);             /* Get SCL line state */
+    
+    /* Optional pre/post transfer hooks */
+    int  (*pre_xfer)(struct i2c_adapter *); /* Called before transfer */
+    void (*post_xfer)(struct i2c_adapter *);/* Called after transfer */
+
+    /* Timing settings */
+    int udelay;         /* half clock cycle time in us:
+                         * minimum 2 us for fast-mode I2C (400kHz)
+                         * minimum 5 us for standard-mode I2C (100kHz)
+                         * maximum 50 us for SMBus */
+    int timeout;        /* in jiffies, for clock stretching */
+    bool can_do_atomic; /* callbacks don't sleep, can be atomic */
+};
+```
+
+### 10.3 I2C时序实现详解
+
+#### 10.3.1 基本信号操作
+
+```
+I2C Signal Timing Diagram:
+                                                              
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │                    I2C Clock and Data Timing                        │
+    └─────────────────────────────────────────────────────────────────────┘
+                                                              
+    SCL ─────┐     ┌─────┐     ┌─────┐     ┌─────┐     ┌─────┐     ┌─────
+             │     │     │     │     │     │     │     │     │     │
+             └─────┘     └─────┘     └─────┘     └─────┘     └─────┘
+                                                              
+    SDA ───┐       X─────X─────X─────X─────X─────X─────X─────X       ┌───
+           │       │ D7  │ D6  │ D5  │ D4  │ D3  │ D2  │ D1  │ D0  │ │
+           └───────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴─┘
+           │                                                       │
+         START                                                   STOP
+                                                              
+    ◄──────── udelay/2 ────────►◄──────── udelay/2 ────────►
+    
+    START condition: SDA goes LOW while SCL is HIGH
+    STOP condition:  SDA goes HIGH while SCL is HIGH
+    Data valid:      SDA must be stable when SCL is HIGH
+```
+
+#### 10.3.2 底层位操作函数
+
+```c
+// drivers/i2c/algos/i2c-algo-bit.c
+
+/* Macros to access the callbacks */
+#define setsda(adap, val)   adap->setsda(adap->data, val)
+#define setscl(adap, val)   adap->setscl(adap->data, val)
+#define getsda(adap)        adap->getsda(adap->data)
+#define getscl(adap)        adap->getscl(adap->data)
+
+/* Pull SDA low */
+static inline void sdalo(struct i2c_algo_bit_data *adap)
+{
+    setsda(adap, 0);
+    udelay((adap->udelay + 1) / 2);  /* Wait half clock cycle */
+}
+
+/* Release SDA (let it float high via pull-up) */
+static inline void sdahi(struct i2c_algo_bit_data *adap)
+{
+    setsda(adap, 1);
+    udelay((adap->udelay + 1) / 2);  /* Wait half clock cycle */
+}
+
+/* Pull SCL low */
+static inline void scllo(struct i2c_algo_bit_data *adap)
+{
+    setscl(adap, 0);
+    udelay(adap->udelay / 2);        /* Wait half clock cycle */
+}
+
+/* Release SCL high with clock stretching support */
+static int sclhi(struct i2c_algo_bit_data *adap)
+{
+    unsigned long start;
+
+    setscl(adap, 1);
+
+    /* If we can read SCL, wait for it to actually go high */
+    /* This handles "clock stretching" by slow slaves */
+    if (!adap->getscl)
+        goto done;
+
+    start = jiffies;
+    while (!getscl(adap)) {
+        /* Wait for slave to release SCL (clock stretching) */
+        if (time_after(jiffies, start + adap->timeout)) {
+            if (getscl(adap))
+                break;
+            return -ETIMEDOUT;  /* Clock stuck low! */
+        }
+        cpu_relax();
+    }
+
+done:
+    udelay(adap->udelay);
+    return 0;
+}
+```
+
+#### 10.3.3 START/STOP条件生成
+
+```c
+// drivers/i2c/algos/i2c-algo-bit.c
+
+/* Generate START condition
+ * Precondition: SCL and SDA are both high (idle state)
+ * 
+ *   SDA ─────┐
+ *            └──────────
+ *   SCL ──────────┐
+ *                 └─────
+ *        │    │    │
+ *        t1   t2   t3
+ */
+static void i2c_start(struct i2c_algo_bit_data *adap)
+{
+    /* assert: scl, sda are high */
+    setsda(adap, 0);        /* t1: Pull SDA low (START condition) */
+    udelay(adap->udelay);   /* t2: Hold time */
+    scllo(adap);            /* t3: Pull SCL low to begin transfer */
+}
+
+/* Generate repeated START condition
+ * Precondition: SCL is low from previous byte
+ *
+ *   SDA ────────┐     ┌────┐
+ *               │     │    └───────
+ *   SCL ────────┴─────┴────────┐
+ *                              └───
+ */
+static void i2c_repstart(struct i2c_algo_bit_data *adap)
+{
+    /* assert: scl is low */
+    sdahi(adap);            /* Release SDA high */
+    sclhi(adap);            /* Release SCL high */
+    setsda(adap, 0);        /* Pull SDA low (START condition) */
+    udelay(adap->udelay);   /* Hold time */
+    scllo(adap);            /* Pull SCL low */
+}
+
+/* Generate STOP condition
+ * Precondition: SCL is low
+ *
+ *   SDA ─────────────────┐
+ *                        └───────
+ *                     ┌──────────
+ *   SCL ──────────────┘
+ */
+static void i2c_stop(struct i2c_algo_bit_data *adap)
+{
+    /* assert: scl is low */
+    sdalo(adap);            /* Ensure SDA is low */
+    sclhi(adap);            /* Release SCL high */
+    setsda(adap, 1);        /* Release SDA high (STOP condition) */
+    udelay(adap->udelay);   /* Bus free time */
+}
+```
+
+#### 10.3.4 字节发送与接收
+
+```c
+// drivers/i2c/algos/i2c-algo-bit.c
+
+/* Send one byte, MSB first
+ * Returns:
+ *   1  = ACK received (success)
+ *   0  = NACK received
+ *  <0  = error (timeout)
+ */
+static int i2c_outb(struct i2c_adapter *i2c_adap, unsigned char c)
+{
+    int i;
+    int sb;
+    int ack;
+    struct i2c_algo_bit_data *adap = i2c_adap->algo_data;
+
+    /* assert: scl is low */
+    for (i = 7; i >= 0; i--) {
+        sb = (c >> i) & 1;              /* Extract bit */
+        setsda(adap, sb);               /* Set SDA to bit value */
+        udelay((adap->udelay + 1) / 2); /* Setup time */
+        if (sclhi(adap) < 0) {          /* Clock the bit out */
+            return -ETIMEDOUT;
+        }
+        scllo(adap);                    /* Prepare for next bit */
+    }
+    
+    /* Read ACK/NACK from slave */
+    sdahi(adap);                        /* Release SDA for slave */
+    if (sclhi(adap) < 0) {              /* Clock in ACK bit */
+        return -ETIMEDOUT;
+    }
+
+    /* ACK = SDA pulled low by slave, NACK = SDA stays high */
+    ack = !adap->getsda || !getsda(adap);
+    
+    scllo(adap);
+    return ack;
+    /* assert: scl is low (sda undefined) */
+}
+
+/* Receive one byte, MSB first */
+static int i2c_inb(struct i2c_adapter *i2c_adap)
+{
+    int i;
+    unsigned char indata = 0;
+    struct i2c_algo_bit_data *adap = i2c_adap->algo_data;
+
+    /* assert: scl is low */
+    sdahi(adap);                        /* Release SDA for slave to drive */
+    
+    for (i = 0; i < 8; i++) {
+        if (sclhi(adap) < 0) {          /* Clock in bit */
+            return -ETIMEDOUT;
+        }
+        indata *= 2;                    /* Shift left */
+        if (getsda(adap))
+            indata |= 0x01;             /* Read bit from SDA */
+        setscl(adap, 0);                /* Pull SCL low */
+        udelay(i == 7 ? adap->udelay / 2 : adap->udelay);
+    }
+    /* assert: scl is low */
+    return indata;
+}
+
+/* Send ACK or NACK after receiving a byte */
+static int acknak(struct i2c_adapter *i2c_adap, int is_ack)
+{
+    struct i2c_algo_bit_data *adap = i2c_adap->algo_data;
+
+    /* assert: sda is high (released) */
+    if (is_ack)
+        setsda(adap, 0);    /* ACK = pull SDA low */
+    /* else NACK = leave SDA high */
+    
+    udelay((adap->udelay + 1) / 2);
+    if (sclhi(adap) < 0) {  /* Clock out ACK/NACK */
+        return -ETIMEDOUT;
+    }
+    scllo(adap);
+    return 0;
+}
+```
+
+### 10.4 完整传输流程
+
+```mermaid
+flowchart TB
+    subgraph "bit_xfer() - Main Transfer Function"
+        START[Start] --> PREXFER{pre_xfer<br/>callback?}
+        PREXFER -->|Yes| CALLPRE[Call pre_xfer]
+        PREXFER -->|No| GENSTART
+        CALLPRE --> GENSTART[Generate START<br/>i2c_start]
+        
+        GENSTART --> MSGLOOP[For each message]
+        
+        MSGLOOP --> NOSTART{I2C_M_NOSTART<br/>flag?}
+        NOSTART -->|No| FIRSTMSG{First<br/>message?}
+        NOSTART -->|Yes| READWRITE
+        
+        FIRSTMSG -->|Yes| DOADDR
+        FIRSTMSG -->|No| STOPFLAG{Previous msg<br/>has STOP flag?}
+        
+        STOPFLAG -->|Yes| STOPSTART[Stop + Start]
+        STOPFLAG -->|No| REPSTART[Repeated Start<br/>i2c_repstart]
+        
+        STOPSTART --> DOADDR
+        REPSTART --> DOADDR
+        
+        DOADDR[bit_doAddress<br/>Send addr + R/W] --> ADDRACK{ACK<br/>received?}
+        
+        ADDRACK -->|No| BAILOUT[Bailout<br/>-ENXIO]
+        ADDRACK -->|Yes| READWRITE{Read or<br/>Write?}
+        
+        READWRITE -->|Read| READBYTES[readbytes<br/>Receive data]
+        READWRITE -->|Write| SENDBYTES[sendbytes<br/>Transmit data]
+        
+        READBYTES --> NEXTMSG
+        SENDBYTES --> NEXTMSG
+        
+        NEXTMSG{More<br/>messages?} -->|Yes| MSGLOOP
+        NEXTMSG -->|No| GENSTOP
+        
+        BAILOUT --> GENSTOP
+        GENSTOP[Generate STOP<br/>i2c_stop] --> POSTXFER{post_xfer<br/>callback?}
+        
+        POSTXFER -->|Yes| CALLPOST[Call post_xfer]
+        POSTXFER -->|No| RETURN
+        CALLPOST --> RETURN[Return result]
+    end
+```
+
+### 10.5 Bit-Bang时序图
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CPU as CPU / bit_xfer
+    participant SDA as SDA Line
+    participant SCL as SCL Line
+    participant Slave as I2C Slave
+
+    Note over CPU,Slave: === START Condition ===
+    CPU->>SDA: setsda(0) - Pull LOW
+    Note over SDA: SDA goes LOW while SCL HIGH
+    CPU->>CPU: udelay(udelay)
+    CPU->>SCL: setscl(0) - Pull LOW
+
+    Note over CPU,Slave: === Send Address Byte (0x50 Write) ===
+    loop For each bit (7 downto 0)
+        CPU->>SDA: setsda(bit)
+        CPU->>CPU: udelay(udelay/2)
+        CPU->>SCL: setscl(1) - Release HIGH
+        alt Clock Stretching
+            loop while SCL LOW
+                CPU->>SCL: getscl() check
+                Note over Slave: Slave holds SCL LOW
+            end
+            Slave->>SCL: Release SCL
+        end
+        CPU->>CPU: udelay(udelay)
+        CPU->>SCL: setscl(0) - Pull LOW
+    end
+
+    Note over CPU,Slave: === Read ACK ===
+    CPU->>SDA: setsda(1) - Release for slave
+    CPU->>SCL: setscl(1) - Release HIGH
+    Slave->>SDA: Pull LOW (ACK)
+    CPU->>SDA: getsda() - Read ACK
+    CPU->>SCL: setscl(0) - Pull LOW
+
+    Note over CPU,Slave: === Send Data Bytes ===
+    loop For each data byte
+        loop For each bit (7 downto 0)
+            CPU->>SDA: setsda(bit)
+            CPU->>SCL: setscl(1) then setscl(0)
+        end
+        CPU->>SDA: setsda(1) - Release for ACK
+        CPU->>SCL: setscl(1)
+        Slave->>SDA: ACK/NACK
+        CPU->>SCL: setscl(0)
+    end
+
+    Note over CPU,Slave: === STOP Condition ===
+    CPU->>SDA: setsda(0) - Ensure LOW
+    CPU->>SCL: setscl(1) - Release HIGH
+    CPU->>SDA: setsda(1) - Release HIGH
+    Note over SDA: SDA goes HIGH while SCL HIGH
+```
+
+---
+
+## 11. I2C Adapter驱动详解 - 树莓派BCM2835
+
+树莓派使用Broadcom BCM2835/BCM2711 SoC，其中包含专用的I2C硬件控制器（BSC - Broadcom Serial Controller）。
+
+### 11.1 BCM2835 I2C硬件架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    BCM2835 I2C Controller (BSC)                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         BCM2835 SoC                                         │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │                      BSC (I2C Controller)                             │ │
+│  │                                                                       │ │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │ │
+│  │  │ Control Reg │  │ Status Reg  │  │ Data Length │  │  Address    │  │ │
+│  │  │   (C)       │  │   (S)       │  │   (DLEN)    │  │   (A)       │  │ │
+│  │  │ 0x7E804000  │  │ 0x7E804004  │  │ 0x7E804008  │  │ 0x7E80400C  │  │ │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘  │ │
+│  │                                                                       │ │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │ │
+│  │  │  FIFO Reg   │  │ Clock Div   │  │ Data Delay  │  │ Clock Tout  │  │ │
+│  │  │   (FIFO)    │  │   (DIV)     │  │   (DEL)     │  │   (CLKT)    │  │ │
+│  │  │ 0x7E804010  │  │ 0x7E804014  │  │ 0x7E804018  │  │ 0x7E80401C  │  │ │
+│  │  └──────┬──────┘  └─────────────┘  └─────────────┘  └─────────────┘  │ │
+│  │         │                                                             │ │
+│  │         │  16-byte TX/RX FIFO                                        │ │
+│  │         ▼                                                             │ │
+│  │  ┌─────────────────────────────────────────────────────────────────┐ │ │
+│  │  │                    I2C State Machine                            │ │ │
+│  │  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐            │ │ │
+│  │  │  │  IDLE   │──│  START  │──│  ADDR   │──│  DATA   │──┐         │ │ │
+│  │  │  └─────────┘  └─────────┘  └─────────┘  └─────────┘  │         │ │ │
+│  │  │       ▲                                              │         │ │ │
+│  │  │       └──────────────────┌─────────┐─────────────────┘         │ │ │
+│  │  │                          │  STOP   │                           │ │ │
+│  │  │                          └─────────┘                           │ │ │
+│  │  └─────────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                       │ │
+│  │                              │ IRQ                                    │ │
+│  └──────────────────────────────┼────────────────────────────────────────┘ │
+│                                 │                                          │
+│                                 ▼                                          │
+│                          ┌─────────────┐                                   │
+│                          │  ARM Core   │                                   │
+│                          └─────────────┘                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+          │                                │
+          │ SDA                            │ SCL
+          ▼                                ▼
+    ┌─────────────────────────────────────────────────────┐
+    │                    I2C Bus                          │
+    │  ┌─────────┐  ┌─────────┐  ┌─────────┐             │
+    │  │ Device  │  │ Device  │  │ Device  │             │
+    │  │  0x50   │  │  0x68   │  │  0x76   │             │
+    │  └─────────┘  └─────────┘  └─────────┘             │
+    └─────────────────────────────────────────────────────┘
+```
+
+### 11.2 BCM2835寄存器定义
+
+```c
+// drivers/i2c/busses/i2c-bcm2835.c
+
+/* Register offsets */
+#define BCM2835_I2C_C       0x00    /* Control Register */
+#define BCM2835_I2C_S       0x04    /* Status Register */
+#define BCM2835_I2C_DLEN    0x08    /* Data Length Register */
+#define BCM2835_I2C_A       0x0c    /* Slave Address Register */
+#define BCM2835_I2C_FIFO    0x10    /* Data FIFO Register */
+#define BCM2835_I2C_DIV     0x14    /* Clock Divider Register */
+#define BCM2835_I2C_DEL     0x18    /* Data Delay Register */
+#define BCM2835_I2C_CLKT    0x1c    /* Clock Stretch Timeout Register */
+
+/* Control Register bits */
+#define BCM2835_I2C_C_READ  BIT(0)  /* Read transfer */
+#define BCM2835_I2C_C_CLEAR BIT(4)  /* Clear FIFO (bits 4 and 5) */
+#define BCM2835_I2C_C_ST    BIT(7)  /* Start transfer */
+#define BCM2835_I2C_C_INTD  BIT(8)  /* Interrupt on DONE */
+#define BCM2835_I2C_C_INTT  BIT(9)  /* Interrupt on TX */
+#define BCM2835_I2C_C_INTR  BIT(10) /* Interrupt on RX */
+#define BCM2835_I2C_C_I2CEN BIT(15) /* I2C Enable */
+
+/* Status Register bits */
+#define BCM2835_I2C_S_TA    BIT(0)  /* Transfer Active */
+#define BCM2835_I2C_S_DONE  BIT(1)  /* Transfer Done */
+#define BCM2835_I2C_S_TXW   BIT(2)  /* FIFO needs Writing */
+#define BCM2835_I2C_S_RXR   BIT(3)  /* FIFO needs Reading */
+#define BCM2835_I2C_S_TXD   BIT(4)  /* FIFO can accept data */
+#define BCM2835_I2C_S_RXD   BIT(5)  /* FIFO contains data */
+#define BCM2835_I2C_S_TXE   BIT(6)  /* FIFO Empty */
+#define BCM2835_I2C_S_RXF   BIT(7)  /* FIFO Full */
+#define BCM2835_I2C_S_ERR   BIT(8)  /* ACK Error */
+#define BCM2835_I2C_S_CLKT  BIT(9)  /* Clock Stretch Timeout */
+```
+
+### 11.3 驱动数据结构
+
+```c
+// drivers/i2c/busses/i2c-bcm2835.c
+
+struct bcm2835_i2c_dev {
+    struct device *dev;
+    void __iomem *regs;             /* Memory-mapped registers */
+    int irq;                        /* IRQ number */
+    struct i2c_adapter adapter;     /* I2C adapter structure */
+    struct completion completion;   /* Transfer completion */
+    struct i2c_msg *curr_msg;       /* Current message being processed */
+    struct clk *bus_clk;            /* I2C bus clock */
+    int num_msgs;                   /* Number of messages remaining */
+    u32 msg_err;                    /* Error flags */
+    u8 *msg_buf;                    /* Current buffer pointer */
+    size_t msg_buf_remaining;       /* Bytes remaining in buffer */
+};
+```
+
+### 11.4 BCM2835传输流程
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client as I2C Client
+    participant Core as I2C Core
+    participant BCM as bcm2835_i2c_xfer
+    participant ISR as bcm2835_i2c_isr
+    participant HW as BCM2835 Hardware
+
+    Client->>Core: i2c_transfer(msgs, num)
+    Core->>BCM: algo->xfer(adap, msgs, num)
+    
+    Note over BCM: Initialize transfer
+    BCM->>BCM: Setup curr_msg, num_msgs
+    BCM->>BCM: reinit_completion()
+    
+    BCM->>HW: Write Address to A register
+    BCM->>HW: Write Length to DLEN register
+    BCM->>HW: Write Control (ST | I2CEN | INT*)
+    
+    Note over HW: Hardware generates START
+    Note over HW: Hardware sends address
+    
+    alt Write Transfer
+        HW-->>ISR: TXW interrupt (FIFO needs data)
+        ISR->>HW: Write data to FIFO
+        loop While more data
+            HW-->>ISR: TXW interrupt
+            ISR->>HW: Write more data
+        end
+    else Read Transfer
+        loop While more data expected
+            HW-->>ISR: RXR interrupt (FIFO has data)
+            ISR->>HW: Read data from FIFO
+        end
+    end
+    
+    Note over HW: Hardware generates STOP
+    HW-->>ISR: DONE interrupt
+    ISR->>ISR: complete(&completion)
+    
+    BCM->>BCM: wait_for_completion_timeout()
+    BCM-->>Core: Return num or error
+    Core-->>Client: Return result
+```
+
+### 11.5 关键函数实现
+
+#### 11.5.1 启动传输
+
+```c
+// drivers/i2c/busses/i2c-bcm2835.c
+
+static void bcm2835_i2c_start_transfer(struct bcm2835_i2c_dev *i2c_dev)
+{
+    u32 c = BCM2835_I2C_C_ST | BCM2835_I2C_C_I2CEN;
+    struct i2c_msg *msg = i2c_dev->curr_msg;
+    bool last_msg = (i2c_dev->num_msgs == 1);
+
+    if (!i2c_dev->num_msgs)
+        return;
+
+    i2c_dev->num_msgs--;
+    i2c_dev->msg_buf = msg->buf;
+    i2c_dev->msg_buf_remaining = msg->len;
+
+    /* Configure for read or write */
+    if (msg->flags & I2C_M_RD)
+        c |= BCM2835_I2C_C_READ | BCM2835_I2C_C_INTR;  /* Read + RX interrupt */
+    else
+        c |= BCM2835_I2C_C_INTT;  /* Write + TX interrupt */
+
+    /* Enable DONE interrupt for last message */
+    if (last_msg)
+        c |= BCM2835_I2C_C_INTD;
+
+    /* Write registers and start transfer */
+    bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_A, msg->addr);
+    bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_DLEN, msg->len);
+    bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_C, c);
+}
+```
+
+#### 11.5.2 中断处理
+
+```c
+// drivers/i2c/busses/i2c-bcm2835.c
+
+static irqreturn_t bcm2835_i2c_isr(int this_irq, void *data)
+{
+    struct bcm2835_i2c_dev *i2c_dev = data;
+    u32 val, err;
+
+    /* Read status register */
+    val = bcm2835_i2c_readl(i2c_dev, BCM2835_I2C_S);
+
+    /* Check for errors (ACK error or clock timeout) */
+    err = val & (BCM2835_I2C_S_CLKT | BCM2835_I2C_S_ERR);
+    if (err && !(val & BCM2835_I2C_S_TA))
+        i2c_dev->msg_err = err;
+
+    /* Transfer complete */
+    if (val & BCM2835_I2C_S_DONE) {
+        if (i2c_dev->curr_msg->flags & I2C_M_RD)
+            bcm2835_drain_rxfifo(i2c_dev);
+        goto complete;
+    }
+
+    /* TX FIFO needs more data */
+    if (val & BCM2835_I2C_S_TXW) {
+        bcm2835_fill_txfifo(i2c_dev);
+        
+        /* Start next message if current is done */
+        if (i2c_dev->num_msgs && !i2c_dev->msg_buf_remaining) {
+            i2c_dev->curr_msg++;
+            bcm2835_i2c_start_transfer(i2c_dev);
+        }
+        return IRQ_HANDLED;
+    }
+
+    /* RX FIFO has data */
+    if (val & BCM2835_I2C_S_RXR) {
+        bcm2835_drain_rxfifo(i2c_dev);
+        return IRQ_HANDLED;
+    }
+
+    return IRQ_NONE;
+
+complete:
+    /* Clear status and signal completion */
+    bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_C, BCM2835_I2C_C_CLEAR);
+    bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_S, 
+                       BCM2835_I2C_S_CLKT | BCM2835_I2C_S_ERR | BCM2835_I2C_S_DONE);
+    complete(&i2c_dev->completion);
+    return IRQ_HANDLED;
+}
+```
+
+#### 11.5.3 FIFO操作
+
+```c
+// drivers/i2c/busses/i2c-bcm2835.c
+
+/* Fill TX FIFO with data to send */
+static void bcm2835_fill_txfifo(struct bcm2835_i2c_dev *i2c_dev)
+{
+    u32 val;
+
+    while (i2c_dev->msg_buf_remaining) {
+        val = bcm2835_i2c_readl(i2c_dev, BCM2835_I2C_S);
+        if (!(val & BCM2835_I2C_S_TXD))  /* FIFO full? */
+            break;
+        bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_FIFO,
+                           *i2c_dev->msg_buf);
+        i2c_dev->msg_buf++;
+        i2c_dev->msg_buf_remaining--;
+    }
+}
+
+/* Drain RX FIFO into receive buffer */
+static void bcm2835_drain_rxfifo(struct bcm2835_i2c_dev *i2c_dev)
+{
+    u32 val;
+
+    while (i2c_dev->msg_buf_remaining) {
+        val = bcm2835_i2c_readl(i2c_dev, BCM2835_I2C_S);
+        if (!(val & BCM2835_I2C_S_RXD))  /* FIFO empty? */
+            break;
+        *i2c_dev->msg_buf = bcm2835_i2c_readl(i2c_dev,
+                                              BCM2835_I2C_FIFO);
+        i2c_dev->msg_buf++;
+        i2c_dev->msg_buf_remaining--;
+    }
+}
+```
+
+### 11.6 驱动探测和注册
+
+```c
+// drivers/i2c/busses/i2c-bcm2835.c
+
+/* Algorithm definition */
+static const struct i2c_algorithm bcm2835_i2c_algo = {
+    .xfer = bcm2835_i2c_xfer,
+    .functionality = bcm2835_i2c_func,
+};
+
+/* Known hardware quirks */
+static const struct i2c_adapter_quirks bcm2835_i2c_quirks = {
+    .flags = I2C_AQ_NO_CLK_STRETCH,  /* Clock stretching has issues */
+};
+
+static int bcm2835_i2c_probe(struct platform_device *pdev)
+{
+    struct bcm2835_i2c_dev *i2c_dev;
+    struct i2c_adapter *adap;
+    int ret;
+    u32 bus_clk_rate;
+
+    /* Allocate driver data */
+    i2c_dev = devm_kzalloc(&pdev->dev, sizeof(*i2c_dev), GFP_KERNEL);
+    if (!i2c_dev)
+        return -ENOMEM;
+
+    /* Get and map registers */
+    i2c_dev->regs = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
+    if (IS_ERR(i2c_dev->regs))
+        return PTR_ERR(i2c_dev->regs);
+
+    /* Setup clock */
+    mclk = devm_clk_get(&pdev->dev, NULL);
+    i2c_dev->bus_clk = bcm2835_i2c_register_div(&pdev->dev, mclk, i2c_dev);
+    
+    /* Get clock frequency from device tree (default 100kHz) */
+    of_property_read_u32(pdev->dev.of_node, "clock-frequency", &bus_clk_rate);
+    clk_set_rate_exclusive(i2c_dev->bus_clk, bus_clk_rate);
+    clk_prepare_enable(i2c_dev->bus_clk);
+
+    /* Setup IRQ */
+    i2c_dev->irq = platform_get_irq(pdev, 0);
+    request_irq(i2c_dev->irq, bcm2835_i2c_isr, IRQF_SHARED,
+                dev_name(&pdev->dev), i2c_dev);
+
+    /* Setup and register adapter */
+    adap = &i2c_dev->adapter;
+    i2c_set_adapdata(adap, i2c_dev);
+    adap->owner = THIS_MODULE;
+    snprintf(adap->name, sizeof(adap->name), "bcm2835 (%s)",
+             of_node_full_name(pdev->dev.of_node));
+    adap->algo = &bcm2835_i2c_algo;
+    adap->dev.parent = &pdev->dev;
+    adap->dev.of_node = pdev->dev.of_node;
+    adap->quirks = of_device_get_match_data(&pdev->dev);
+
+    return i2c_add_adapter(adap);
+}
+
+/* Device tree matching */
+static const struct of_device_id bcm2835_i2c_of_match[] = {
+    { .compatible = "brcm,bcm2711-i2c" },
+    { .compatible = "brcm,bcm2835-i2c", .data = &bcm2835_i2c_quirks },
+    {},
+};
+
+static struct platform_driver bcm2835_i2c_driver = {
+    .probe      = bcm2835_i2c_probe,
+    .remove_new = bcm2835_i2c_remove,
+    .driver     = {
+        .name   = "i2c-bcm2835",
+        .of_match_table = bcm2835_i2c_of_match,
+    },
+};
+module_platform_driver(bcm2835_i2c_driver);
+```
+
+### 11.7 BCM2835 vs Bit-Bang对比
+
+| 特性 | BCM2835 硬件控制器 | Bit-Bang (GPIO) |
+|------|-------------------|-----------------|
+| **CPU占用** | 低（中断驱动） | 高（轮询延时） |
+| **速度** | 高达400kHz+ | 通常<100kHz |
+| **时序精度** | 硬件保证 | 依赖软件延时 |
+| **FIFO** | 16字节硬件FIFO | 无 |
+| **Clock Stretching** | 有限支持（有bug） | 支持（getscl） |
+| **多主机仲裁** | 硬件支持 | 需软件实现 |
+| **引脚** | 专用I2C引脚 | 任意GPIO |
+| **调试难度** | 较难（硬件封装） | 较易（可逐步调试） |
+
+### 11.8 树莓派I2C设备树配置示例
+
+```dts
+// arch/arm/boot/dts/broadcom/bcm2835-common.dtsi
+
+i2c0: i2c@7e205000 {
+    compatible = "brcm,bcm2835-i2c";
+    reg = <0x7e205000 0x200>;
+    interrupts = <2 21>;
+    clocks = <&clocks BCM2835_CLOCK_VPU>;
+    #address-cells = <1>;
+    #size-cells = <0>;
+    status = "disabled";
+};
+
+i2c1: i2c@7e804000 {
+    compatible = "brcm,bcm2835-i2c";
+    reg = <0x7e804000 0x1000>;
+    interrupts = <2 21>;
+    clocks = <&clocks BCM2835_CLOCK_VPU>;
+    #address-cells = <1>;
+    #size-cells = <0>;
+    status = "disabled";
+};
+
+/* Example device node */
+&i2c1 {
+    status = "okay";
+    clock-frequency = <100000>;  /* 100kHz standard mode */
+    
+    eeprom@50 {
+        compatible = "atmel,24c32";
+        reg = <0x50>;
+    };
+    
+    rtc@68 {
+        compatible = "dallas,ds1307";
+        reg = <0x68>;
+    };
+};
+```
+
+---
+
+## 12. 算法与适配器对比总结
+
+### 12.1 不同类型I2C实现对比
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                   I2C Implementation Comparison                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌───────────────────┬───────────────────┬───────────────────┬─────────────────┐
+│     Type          │   Bit-Bang        │  Hardware Ctrl    │  State Machine  │
+│                   │   (i2c-gpio)      │  (i2c-bcm2835)    │  (i2c-algo-pca) │
+├───────────────────┼───────────────────┼───────────────────┼─────────────────┤
+│                   │                   │                   │                 │
+│   CPU in loop     │     ┌─────┐      │    ┌─────┐       │    ┌─────┐      │
+│                   │     │ CPU │──┐   │    │ CPU │       │    │ CPU │       │
+│                   │     └─────┘  │   │    └──┬──┘       │    └──┬──┘       │
+│                   │        │     │   │       │          │       │          │
+│                   │        ▼     │   │       │ IRQ      │       │ Read/    │
+│   GPIO Control    │     ┌─────┐ │   │       │          │       │ Write    │
+│                   │     │ GPIO│ │   │       ▼          │       ▼          │
+│                   │     └──┬──┘ │   │    ┌──────┐      │    ┌──────┐      │
+│                   │        │    │   │    │ I2C  │      │    │PCA   │      │
+│   I2C Lines       │        │    │   │    │ HW   │      │    │9564  │      │
+│                   │     ┌──┴──┐ │   │    │ Ctrl │      │    │9665  │      │
+│                   │     │ SDA │◄┘   │    └──┬───┘      │    └──┬───┘      │
+│                   │     │ SCL │     │       │          │       │          │
+│                   │     └─────┘     │       ▼          │       ▼          │
+│                   │                 │    ┌─────┐       │    ┌─────┐       │
+│                   │                 │    │ SDA │       │    │ SDA │       │
+│                   │                 │    │ SCL │       │    │ SCL │       │
+│                   │                 │    └─────┘       │    └─────┘       │
+│                   │                 │                   │                 │
+├───────────────────┼───────────────────┼───────────────────┼─────────────────┤
+│ Algorithm File    │ i2c-algo-bit.c    │ Built-in algo    │ i2c-algo-pca.c  │
+│ Adapter File      │ i2c-gpio.c        │ i2c-bcm2835.c    │ i2c-pca-*.c     │
+│ Timing Control    │ udelay()          │ Clock divider    │ Hardware regs   │
+│ Transfer Model    │ Synchronous       │ IRQ + completion │ State polling   │
+│ Speed             │ ~100kHz max       │ Up to 400kHz+    │ Up to 400kHz    │
+└───────────────────┴───────────────────┴───────────────────┴─────────────────┘
+```
+
+### 12.2 选择指南
+
+```mermaid
+flowchart TD
+    START[需要I2C通信] --> HAS_HW{SoC有专用<br/>I2C控制器?}
+    
+    HAS_HW -->|Yes| USE_HW[使用硬件控制器驱动<br/>如 i2c-bcm2835]
+    HAS_HW -->|No| HAS_PCA{有PCA9564/9665<br/>外部芯片?}
+    
+    HAS_PCA -->|Yes| USE_PCA[使用 i2c-algo-pca]
+    HAS_PCA -->|No| USE_GPIO[使用 i2c-gpio<br/>+ i2c-algo-bit]
+    
+    USE_HW --> SPEED{需要高速?}
+    SPEED -->|Yes| FAST[配置 Fast Mode 400kHz]
+    SPEED -->|No| STD[配置 Standard Mode 100kHz]
+    
+    USE_PCA --> DONE
+    USE_GPIO --> TIMING[配置 udelay 参数<br/>5us=100kHz, 2.5us=200kHz]
+    
+    FAST --> DONE[完成配置]
+    STD --> DONE
+    TIMING --> DONE
+```
 
 ---
 
